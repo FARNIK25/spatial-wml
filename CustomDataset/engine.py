@@ -5,6 +5,7 @@ Train and eval functions used in main.py
 """
 import math
 import sys
+from contextlib import nullcontext
 from typing import Iterable, Optional
 
 import torch
@@ -20,12 +21,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True):
-    model.train(set_training_mode)
+                    set_training_mode=True, modules_to_train: Optional[Iterable[torch.nn.Module]] = None):
+    if modules_to_train:
+        model.train(False)
+        for submodule in modules_to_train:
+            submodule.train(True)
+    else:
+        model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
+
+    autocast = torch.cuda.amp.autocast if torch.cuda.is_available() else nullcontext
 
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
@@ -34,7 +42,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+        with autocast():
             outputs = model(samples)
             loss = criterion(samples, outputs, targets)
 
@@ -51,7 +59,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=is_second_order)
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         if model_ema is not None:
             model_ema.update(model)
 
@@ -73,12 +82,14 @@ def evaluate(data_loader, model, device):
     # switch to evaluation mode
     model.eval()
 
+    autocast = torch.cuda.amp.autocast if torch.cuda.is_available() else nullcontext
+
     for images, target in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast():
+        with autocast():
             output = model(images)
             loss = criterion(output, target)
 

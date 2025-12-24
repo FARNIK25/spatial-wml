@@ -1,24 +1,64 @@
 import argparse
 import datetime
-import numpy as np
+import json
 import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-import json
-
-from pathlib import Path
 from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
+from timm.optim.optim_factory import param_groups_layer_decay
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 import utils
-import MedViT 
+import MedViT
+from radimagenet import create_radimagenet_model, is_radimagenet_model, radimagenet_input_resolution
+
+
+def _create_model_with_vgg_support(
+    model_name: str,
+    num_classes: int,
+    *,
+    radimagenet_weights_root: Optional[Path] = None,
+    radimagenet_checkpoint: Optional[Path] = None,
+    radimagenet_auto_download: bool = False,
+    timm_pretrained: bool = False,
+) -> torch.nn.Module:
+    """Instantiate backbone, adding torchvision VGG16 and RadImageNet support."""
+
+    if is_radimagenet_model(model_name):
+        weights_root = Path(radimagenet_weights_root).expanduser() if radimagenet_weights_root else None
+        checkpoint_override = Path(radimagenet_checkpoint).expanduser() if radimagenet_checkpoint else None
+        return create_radimagenet_model(
+            model_name,
+            num_classes,
+            weights_root=weights_root,
+            checkpoint_override=checkpoint_override,
+            auto_download=radimagenet_auto_download,
+        )
+
+    if model_name.lower() == "vgg16_bn":
+        from torchvision.models import vgg16_bn, VGG16_BN_Weights
+
+        print("Loading torchvision VGG16_bn pretrained on ImageNet-1k.")
+        vgg_model = vgg16_bn(weights=VGG16_BN_Weights.IMAGENET1K_V1)
+        in_features = vgg_model.classifier[-1].in_features
+        if in_features is None:
+            raise RuntimeError("Unexpected VGG classifier configuration; cannot determine input features.")
+        if vgg_model.classifier[-1].out_features != num_classes:
+            vgg_model.classifier[-1] = torch.nn.Linear(in_features, num_classes)
+        return vgg_model
+
+    return create_model(model_name, pretrained=timm_pretrained, num_classes=num_classes)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MedViT training and evaluation script', add_help=False)
@@ -29,6 +69,16 @@ def get_args_parser():
     parser.add_argument('--model', default='MedViT_small', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
+    parser.add_argument('--layer-decay', default=1.0, type=float,
+                        help='Layer-wise learning rate decay factor (1.0 disables).')
+    parser.add_argument('--radimagenet-weights-root', default=None, type=str,
+                        help='Optional directory containing RadImageNet checkpoints. Prefix model name with "radimagenet_" to enable.')
+    parser.add_argument('--radimagenet-checkpoint', default=None, type=str,
+                        help='Explicit RadImageNet checkpoint path (overrides weights root lookup).')
+    parser.add_argument('--radimagenet-auto-download', action='store_true',
+                        help='Attempt to download missing RadImageNet checkpoints when URLs are available.')
+    parser.add_argument('--timm-pretrained', action='store_true',
+                        help='Request ImageNet-1k pretrained weights for timm models when available.')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
                         help='Dropout rate (default: 0.)')
@@ -54,6 +104,11 @@ def get_args_parser():
                         help='LR scheduler (default: "cosine"')
     parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
+    parser.add_argument('--disable-lr-scaling', action='store_true',
+                        help='Disable automatic learning-rate scaling based on batch size and world size.')
+    parser.add_argument('--enable-lr-scaling', action='store_false', dest='disable_lr_scaling',
+                        help='Re-enable automatic learning-rate scaling when previously disabled.')
+    parser.set_defaults(disable_lr_scaling=False)
     parser.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
     parser.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
@@ -116,13 +171,28 @@ def get_args_parser():
 
     # * Finetuning params
     parser.add_argument('--finetune', action='store_true', help='Perform finetune.')
+    parser.add_argument('--linear-probe', action='store_true', help='Freeze backbone and train only the classifier head.')
+    parser.add_argument('--linear-probe-train-stages', type=int, nargs='+', default=None,
+                        help='Optional 0-indexed backbone stages to unfreeze when linear probing.')
+    parser.add_argument('--linear-probe-train-last-blocks', type=int, default=0,
+                        help='Optional count of final backbone blocks to unfreeze when linear probing.')
+    parser.add_argument('--linear-probe-train-norm', action='store_true',
+                        help='Also unfreeze the final normalization layer when linear probing.')
+    parser.add_argument('--linear-probe-train-features-from', type=int, default=None,
+                        help='0-based index within model.features to start unfreezing when linear probing.')
 
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
     parser.add_argument('--data-set', default='CIFAR', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'image_folder'],
                         type=str, help='CIFAR dataset path')
+    parser.add_argument('--eval-data-path', default=None, type=str,
+                        help='Optional evaluation dataset path when using image_folder datasets')
+    parser.add_argument('--nb-classes', default=None, type=int,
+                        help='Number of classes for datasets without predefined metadata. Required when using image_folder if auto-inference fails.')
     parser.add_argument('--use-mcloader', action='store_true', default=False, help='Use mcloader')
+    parser.add_argument('--balance-sampler', action='store_true',
+                        help='Enable class-balanced sampling (single-process ImageFolder only).')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
                         type=str, help='semantic granularity')
@@ -179,6 +249,22 @@ def main(args):
 
     device = torch.device(args.device)
 
+    if is_radimagenet_model(args.model):
+        recommended_size = radimagenet_input_resolution(args.model)
+        if recommended_size and args.input_size != recommended_size:
+            print(
+                f"Adjusting input-size from {args.input_size} to {recommended_size} for {args.model}. "
+                "Override with --input-size to keep a custom resolution."
+            )
+            args.input_size = recommended_size
+
+    if (not args.linear_probe) and (
+        args.linear_probe_train_last_blocks > 0 or
+        (args.linear_probe_train_stages and len(args.linear_probe_train_stages) > 0) or
+        args.linear_probe_train_norm
+    ):
+        raise ValueError("Linear probe unfreeze options require --linear-probe to be set.")
+
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -187,6 +273,19 @@ def main(args):
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
+
+    def _build_balanced_sampler(dataset, num_classes: int):
+        if not hasattr(dataset, 'samples'):
+            raise ValueError("balance-sampler requires a dataset exposing a 'samples' attribute")
+        targets = [sample[1] for sample in dataset.samples]
+        if not targets:
+            raise ValueError('balance-sampler cannot operate on an empty dataset')
+        class_counts = np.bincount(targets, minlength=num_classes)
+        if np.any(class_counts == 0):
+            raise ValueError('balance-sampler detected classes without samples; please verify the dataset root')
+        class_weights = 1.0 / class_counts
+        sample_weights = [class_weights[target] for target in targets]
+        return torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -211,6 +310,14 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+    if args.balance_sampler:
+        if args.distributed:
+            raise ValueError('--balance-sampler currently supports only single-process training')
+        if args.data_set != 'image_folder':
+            raise ValueError('--balance-sampler is implemented for image_folder datasets')
+        print('Enabling class-balanced sampling via WeightedRandomSampler.')
+        sampler_train = _build_balanced_sampler(dataset_train, args.nb_classes)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -237,10 +344,135 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
-    model = create_model(
+    model = _create_model_with_vgg_support(
         args.model,
         num_classes=args.nb_classes,
+        radimagenet_weights_root=getattr(args, "radimagenet_weights_root", None),
+        radimagenet_checkpoint=getattr(args, "radimagenet_checkpoint", None),
+        radimagenet_auto_download=getattr(args, "radimagenet_auto_download", False),
+        timm_pretrained=getattr(args, "timm_pretrained", False),
     )
+
+    def _locate_classifier_modules(mod: torch.nn.Module):
+        # Locate linear probe head candidates without assuming exact attribute name.
+        candidate_attrs = ["head", "fc", "classifier", "proj_head"]
+        layers = []
+        for attr in candidate_attrs:
+            if hasattr(mod, attr):
+                obj = getattr(mod, attr)
+                if isinstance(obj, torch.nn.Module):
+                    layers.append(obj)
+        if hasattr(mod, "get_classifier"):
+            try:
+                classifier = mod.get_classifier()
+                if isinstance(classifier, torch.nn.Module):
+                    layers.append(classifier)
+            except TypeError:
+                pass
+        # Deduplicate while preserving order.
+        return list({id(layer): layer for layer in layers}.values())
+
+    partial_train_modules = []
+    partial_unfreeze_notes = []
+
+    if args.linear_probe:
+        print("Enabling linear probe: freezing backbone parameters.")
+        for param in model.parameters():
+            param.requires_grad = False
+        classifier_layers = _locate_classifier_modules(model)
+        if not classifier_layers:
+            raise RuntimeError("Unable to locate classifier head for linear probing.")
+        seen_modules = set()
+
+        def _mark_module_trainable(module: torch.nn.Module):
+            if module is None:
+                return
+            if id(module) in seen_modules:
+                return
+            seen_modules.add(id(module))
+            partial_train_modules.append(module)
+            for param in module.parameters():
+                param.requires_grad = True
+
+        def _append_note(note: str):
+            if note and note not in partial_unfreeze_notes:
+                partial_unfreeze_notes.append(note)
+
+        for layer in classifier_layers:
+            _mark_module_trainable(layer)
+
+        if hasattr(model, "features"):
+            backbone_blocks = list(model.features.children())
+        elif hasattr(model, "stages"):
+            # Models such as ConvNeXt expose backbone stages via a 'stages' sequential container.
+            backbone_blocks = list(model.stages.children())
+        elif hasattr(model, "layers"):
+            # Swin Transformers keep stage modules in a 'layers' ModuleList.
+            backbone_blocks = list(model.layers)
+        else:
+            backbone_blocks = []
+
+        features_start_idx = args.linear_probe_train_features_from
+
+        if args.linear_probe_train_last_blocks > 0:
+            if not backbone_blocks:
+                raise RuntimeError(
+                    "linear-probe-train-last-blocks requires a model exposing a 'features', 'stages', or 'layers' attribute."
+                )
+            requested_blocks = args.linear_probe_train_last_blocks
+            available_blocks = len(backbone_blocks)
+            if requested_blocks > available_blocks:
+                print(f"Requested {requested_blocks} blocks to unfreeze but backbone only has {available_blocks}; unfreezing all blocks instead.")
+                requested_blocks = available_blocks
+            if requested_blocks > 0:
+                for block in backbone_blocks[-requested_blocks:]:
+                    _mark_module_trainable(block)
+                _append_note(f"last {requested_blocks} backbone blocks")
+
+        if features_start_idx is not None:
+            if not backbone_blocks:
+                raise RuntimeError(
+                    "linear-probe-train-features-from requires a model exposing a 'features', 'stages', or 'layers' attribute."
+                )
+            if features_start_idx < 0 or features_start_idx >= len(backbone_blocks):
+                raise ValueError(
+                    f"linear-probe-train-features-from index {features_start_idx} out of range for features length {len(backbone_blocks)}."
+                )
+            for block in backbone_blocks[features_start_idx:]:
+                _mark_module_trainable(block)
+            _append_note(f"features[{features_start_idx}:]")
+
+        if args.linear_probe_train_stages:
+            if not backbone_blocks or not hasattr(model, "stage_out_idx"):
+                raise RuntimeError("linear-probe-train-stages requires a MedViT backbone with stage metadata.")
+            stage_ranges = []
+            start_idx = 0
+            for end_idx in model.stage_out_idx:
+                stage_ranges.append((start_idx, end_idx + 1))
+                start_idx = end_idx + 1
+            num_stages = len(stage_ranges)
+            requested_stages = sorted(set(args.linear_probe_train_stages))
+            invalid_stages = [stage_id for stage_id in requested_stages if stage_id < 0 or stage_id >= num_stages]
+            if invalid_stages:
+                raise ValueError(f"Invalid stage indices {invalid_stages}; valid range is [0, {num_stages - 1}].")
+            for stage_id in requested_stages:
+                block_start, block_end = stage_ranges[stage_id]
+                for block in backbone_blocks[block_start:block_end]:
+                    _mark_module_trainable(block)
+                if stage_id == 0 and hasattr(model, "stem"):
+                    _mark_module_trainable(model.stem)
+                _append_note(f"stage {stage_id}")
+
+        if args.linear_probe_train_norm and hasattr(model, "norm"):
+            _mark_module_trainable(model.norm)
+            _append_note("final normalization layer")
+
+        trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+        frozen_params = sum(param.numel() for param in model.parameters() if not param.requires_grad)
+        print(f"Frozen params: {frozen_params}, trainable params: {trainable_params}")
+        if partial_unfreeze_notes:
+            print("Additional trainable backbone components: " + ", ".join(partial_unfreeze_notes))
+        print("Hint: pass --mixup 0 --cutmix 0 to disable strong augmentation during linear probing.")
 
     if not args.distributed or args.rank == 0:
         print(model)
@@ -252,16 +484,30 @@ def main(args):
     model_ema = None
 
 
+    partial_train_modules = tuple(partial_train_modules)
+
+
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp = model.module
     else:
         model_without_ddp = model
 
-    linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+    if args.disable_lr_scaling:
+        linear_scaled_lr = args.lr
+    else:
+        linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
 
     args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, model_without_ddp)
+    if getattr(args, "layer_decay", 1.0) and args.layer_decay != 1.0:
+        param_groups = param_groups_layer_decay(
+            model_without_ddp,
+            weight_decay=args.weight_decay,
+            layer_decay=args.layer_decay,
+        )
+        optimizer = create_optimizer(args, param_groups)
+    else:
+        optimizer = create_optimizer(args, model_without_ddp)
 
     loss_scaler = NativeScaler()
 
@@ -344,7 +590,8 @@ def main(args):
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=True,
+            set_training_mode=not args.linear_probe,
+            modules_to_train=partial_train_modules if args.linear_probe else None,
         )
 
         lr_scheduler.step(epoch)

@@ -2,6 +2,7 @@ import os
 import json
 
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 from torchvision.datasets.folder import ImageFolder, default_loader
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -78,10 +79,20 @@ def build_dataset(is_train, args):
                               category=args.inat_category, transform=transform)
         nb_classes = dataset.nb_classes
     elif args.data_set == "image_folder":
-        root = args.data_path if is_train else args.eval_data_path
+        root = args.data_path if is_train else (args.eval_data_path or args.data_path)
+        if root is None:
+            raise ValueError("image_folder dataset requires data_path for training and eval_data_path for evaluation")
         dataset = datasets.ImageFolder(root, transform=transform)
-        nb_classes = args.nb_classes
-        assert len(dataset.class_to_idx) == nb_classes
+        inferred_classes = len(dataset.class_to_idx)
+        if args.nb_classes is None:
+            nb_classes = inferred_classes
+        else:
+            nb_classes = args.nb_classes
+            if nb_classes != inferred_classes:
+                raise ValueError(
+                    f"Configured nb_classes={nb_classes} does not match dataset classes={inferred_classes} at {root}"
+                )
+        args.nb_classes = nb_classes
     else:
         raise NotImplementedError()
     print("Number of the class = %d" % nb_classes)
@@ -103,9 +114,16 @@ def build_transform(is_train, args):
             re_mode=args.remode,
             re_count=args.recount,
         )
-        if not resize_im:
-            # replace RandomResizedCropAndInterpolation with
-            # RandomCrop
+        if resize_im:
+            # Force an explicit random crop for large inputs to guarantee augmentation.
+            transform.transforms[0] = transforms.RandomResizedCrop(
+                args.input_size,
+                scale=(0.08, 1.0),
+                ratio=(3.0 / 4.0, 4.0 / 3.0),
+                interpolation=InterpolationMode.BICUBIC,
+            )
+        else:
+            # replace RandomResizedCropAndInterpolation with RandomCrop for tiny inputs
             transform.transforms[0] = transforms.RandomCrop(
                 args.input_size, padding=4)
         return transform

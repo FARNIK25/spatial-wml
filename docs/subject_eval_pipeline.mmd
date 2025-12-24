@@ -1,0 +1,14 @@
+```mermaid
+flowchart TD
+    A[Trained checkpoint
+ct_stroke_ft_MedVit_large_subject
+20251113_215454] --> B[Slice-level inference]
+    B -->|per slice logits| C[Softmax + probability logging]
+    C -->|store subject id, slice index, probabilities| D[Slice CSV]
+    C --> E[Aggregate by subject]
+    E -->|majority vote + probability tie-breaker| F[Subject prediction]
+    F -->|compare vs ground truth| G[Subject CSV]
+    G --> H[Accuracy summary JSON]
+    F --> I[Confusion counts]
+    I --> H
+```
